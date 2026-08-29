@@ -1,0 +1,21 @@
+{
+  "name": "tg-backup",
+  "version": "1.0.0",
+  "description": "Bun CLI tool with TypeScript",
+  "module": "src/index.ts",
+  "type": "module",
+  "bin": {
+    "tg-backup": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "prettier": "^3.9.6",
+    "typescript": "^7.0.2"
+  }
+}
