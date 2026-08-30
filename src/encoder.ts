@@ -6,6 +6,7 @@ import { formatBytes } from './utils/size-utils.ts';
 import { loadGitignoreRules, shouldIgnoreItem } from './utils/ignore-utils.ts';
 import { encryptBuffer } from './utils/crypto-utils.ts';
 import { ProgressBar } from './utils/progress-utils.ts';
+import { sendTelegramDocument } from './utils/telegram-utils.ts';
 
 export interface EncodeOptions {
   inputDir: string;
@@ -20,6 +21,11 @@ export interface EncodeOptions {
   password?: string;
   dryRun?: boolean;
   progress?: boolean;
+  telegramToken?: string;
+  telegramChatId?: string;
+  apiId?: number;
+  apiHash?: string;
+  session?: string;
 }
 
 interface InternalFilePart {
@@ -315,7 +321,8 @@ export async function encodeBackup(options: EncodeOptions): Promise<Manifest> {
     totalFiles: scannedItems.length,
     totalSizeBytes,
     chunkCount: batches.length,
-    encrypted: !!password,
+    encrypted: Boolean(password),
+    prefix,
     chunks: manifestChunks,
     files: scannedItems.map((item) => item.entry),
   };
@@ -363,7 +370,9 @@ export async function encodeBackup(options: EncodeOptions): Promise<Manifest> {
 
   progressBar.finish();
 
-  const manifestPathGz = join(outputDir, 'manifest.json.gz');
+  const manifestFilename =
+    prefix && prefix !== 'chunk_' ? `${prefix}manifest.json.gz` : 'manifest.json.gz';
+  const manifestPathGz = join(outputDir, manifestFilename);
   const manifestJsonBytes = new TextEncoder().encode(JSON.stringify(manifest));
   await Bun.write(manifestPathGz, Bun.gzipSync(manifestJsonBytes));
 

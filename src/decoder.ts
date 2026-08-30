@@ -5,6 +5,7 @@ import { computeFileHash } from './utils/hash-utils.ts';
 import { sanitizePathForOS, resolveCaseCollision } from './utils/path-utils.ts';
 import { decryptBuffer } from './utils/crypto-utils.ts';
 import { ProgressBar } from './utils/progress-utils.ts';
+import { downloadTelegramFile, fetchTelegramChannelFiles } from './utils/telegram-utils.ts';
 
 export interface DecodeOptions {
   inputDir: string;
@@ -12,6 +13,12 @@ export interface DecodeOptions {
   verify?: boolean;
   password?: string;
   progress?: boolean;
+  fromTelegram?: boolean;
+  telegramToken?: string;
+  telegramChatId?: string;
+  apiId?: number;
+  apiHash?: string;
+  session?: string;
 }
 
 /**
@@ -21,23 +28,53 @@ export interface DecodeOptions {
  * @param password Secret password if backup is encrypted
  * @returns Parsed Manifest object
  */
-async function loadManifest(inputDir: string, password?: string): Promise<Manifest> {
-  const manifestGzPath = join(inputDir, 'manifest.json.gz');
-  const manifestGzFile = Bun.file(manifestGzPath);
+async function loadManifest(
+  inputDir: string,
+  password?: string,
+  prefix?: string
+): Promise<Manifest> {
+  const dirFiles = await readdir(inputDir).catch(() => [] as string[]);
 
-  if (await manifestGzFile.exists()) {
-    const compressedBytes = await manifestGzFile.bytes();
-    const decompressedBytes = Bun.gunzipSync(compressedBytes);
-    const text = new TextDecoder().decode(decompressedBytes);
-    return JSON.parse(text) as Manifest;
+  let targetManifestFile: string | undefined;
+
+  if (prefix) {
+    targetManifestFile = dirFiles.find(
+      (f) => f === `${prefix}manifest.json.gz` || f === `${prefix}manifest.json`
+    );
   }
 
-  const manifestPath = join(inputDir, 'manifest.json');
-  const standaloneFile = Bun.file(manifestPath);
+  if (!targetManifestFile) {
+    targetManifestFile = dirFiles.find(
+      (f) => f.endsWith('manifest.json.gz') || f.endsWith('manifest.json')
+    );
+  }
 
-  if (await standaloneFile.exists()) {
-    const text = await standaloneFile.text();
-    return JSON.parse(text) as Manifest;
+  if (targetManifestFile) {
+    const manifestPath = join(inputDir, targetManifestFile);
+    const bunFile = Bun.file(manifestPath);
+
+    if (await bunFile.exists()) {
+      let bytes = await bunFile.bytes();
+
+      if (password) {
+        try {
+          bytes = await decryptBuffer(bytes, password);
+        } catch {}
+      }
+
+      if (targetManifestFile.endsWith('.gz')) {
+        try {
+          const decompressed = Bun.gunzipSync(bytes);
+          const jsonText = new TextDecoder().decode(decompressed);
+          return JSON.parse(jsonText) as Manifest;
+        } catch {}
+      } else {
+        try {
+          const jsonText = new TextDecoder().decode(bytes);
+          return JSON.parse(jsonText) as Manifest;
+        } catch {}
+      }
+    }
   }
 
   const dirEntries = await readdir(inputDir, { withFileTypes: true });

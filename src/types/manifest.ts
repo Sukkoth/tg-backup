@@ -39,6 +39,7 @@ export interface Manifest {
   totalSizeBytes: number;
   chunkCount: number;
   encrypted?: boolean;
+  prefix?: string;
   chunks: ChunkMetadata[];
   files: FileEntry[];
 }
