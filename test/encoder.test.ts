@@ -3,6 +3,11 @@ import { rm, mkdir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parseSizeString, formatBytes } from '../src/utils/size-utils.ts';
 import { parseIgnoreDirs, parseIgnoreExts, shouldIgnoreItem } from '../src/utils/ignore-utils.ts';
+import {
+  sanitizeSegmentForWindows,
+  sanitizePathForOS,
+  resolveCaseCollision,
+} from '../src/utils/path-utils.ts';
 import { computeFileHash } from '../src/utils/hash-utils.ts';
 import { encodeBackup } from '../src/encoder.ts';
 import { decodeBackup } from '../src/decoder.ts';
@@ -52,6 +57,32 @@ describe('Ignore Utils', () => {
     expect(shouldIgnoreItem('photo.jpg', 'photo.jpg', false, ignoreDirs, ignoreExts, gitignoreRules)).toBe(true);
     expect(shouldIgnoreItem('debug.tmp', 'debug.tmp', false, ignoreDirs, ignoreExts, gitignoreRules)).toBe(true);
     expect(shouldIgnoreItem('photo.png', 'photo.png', false, ignoreDirs, ignoreExts, gitignoreRules)).toBe(false);
+  });
+});
+
+describe('Path Utils', () => {
+  test('sanitizes Windows illegal characters', () => {
+    expect(sanitizeSegmentForWindows('log:12:30.txt')).toBe('log%3A12%3A30.txt');
+    expect(sanitizeSegmentForWindows('file*.png')).toBe('file%2A.png');
+    expect(sanitizeSegmentForWindows('query?.json')).toBe('query%3F.json');
+  });
+
+  test('sanitizes relative paths in Windows mode', () => {
+    const { sanitizedPath, wasSanitized } = sanitizePathForOS('logs/app:12:30.log', true);
+    expect(wasSanitized).toBe(true);
+    expect(sanitizedPath).toBe('logs/app%3A12%3A30.log');
+  });
+
+  test('resolves case collisions on case-insensitive filesystems', () => {
+    const caseMap = new Map<string, string>();
+    const res1 = resolveCaseCollision('photo.jpg', caseMap);
+    const res2 = resolveCaseCollision('Photo.jpg', caseMap);
+
+    expect(res1.hadCollision).toBe(false);
+    expect(res1.finalPath).toBe('photo.jpg');
+
+    expect(res2.hadCollision).toBe(true);
+    expect(res2.finalPath).toContain('Photo__case');
   });
 });
 
@@ -117,14 +148,12 @@ describe('Encoder & Decoder Round-Trip Test (Synthetic Data)', () => {
   test('overwrites existing files on re-extraction without creating duplicate files', async () => {
     const overwriteRestoredDir = join(import.meta.dir, 'fixtures/overwrite-test');
 
-    // Run 1
     await decodeBackup({
       inputDir: testOutputDir,
       outputDir: overwriteRestoredDir,
       verify: true,
     });
 
-    // Run 2 (re-extracting into same output folder)
     await decodeBackup({
       inputDir: testOutputDir,
       outputDir: overwriteRestoredDir,
@@ -142,7 +171,6 @@ describe('Encoder & Decoder Round-Trip Test (Synthetic Data)', () => {
     const standaloneManifestPath = join(testOutputDir, 'manifest.json');
     const embeddedRestoredDir = join(import.meta.dir, 'fixtures/embedded-manifest-restored');
 
-    // Remove standalone manifest.json
     await unlink(standaloneManifestPath);
 
     await decodeBackup({
@@ -179,8 +207,9 @@ describe('Encoder & Decoder Round-Trip Test (Real Images Zip Archive)', () => {
 
   afterAll(async () => {
     await rm(imagesDir, { recursive: true, force: true });
-    await rm(imagesChunkDir, { recursive: true, force: true });
-    await rm(imagesRestoredDir, { recursive: true, force: true });
+    await rm(join(import.meta.dir, 'images'), { recursive: true, force: true });
+    await rm(join(import.meta.dir, 'fixtures'), { recursive: true, force: true });
+    await rm(join(import.meta.dir, 'my-backup-output'), { recursive: true, force: true });
   });
 
   test('encodes and decodes images extracted from images.zip with checksum verification', async () => {
@@ -227,7 +256,6 @@ describe('Encoder & Decoder Round-Trip Test (Real Images Zip Archive)', () => {
       compress: true,
     });
 
-    // Delete chunk #2
     const chunk2Meta = manifest.chunks.find((c) => c.index === 2);
     expect(chunk2Meta).toBeDefined();
 
@@ -236,7 +264,6 @@ describe('Encoder & Decoder Round-Trip Test (Real Images Zip Archive)', () => {
       await unlink(chunk2Path);
     }
 
-    // Expect decodeBackup to extract healthy files from chunk 1 & remaining chunks, but throw an error at summary
     expect(
       decodeBackup({
         inputDir: missingChunkOutputDir,
@@ -245,7 +272,6 @@ describe('Encoder & Decoder Round-Trip Test (Real Images Zip Archive)', () => {
       })
     ).rejects.toThrow();
 
-    // Verify healthy files from chunk 1 were extracted successfully
     const chunk1Files = manifest.files.filter((f) => f.parts.every((p) => p.chunkIndex === 1));
     expect(chunk1Files.length).toBeGreaterThan(0);
 
