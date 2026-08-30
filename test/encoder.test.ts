@@ -48,18 +48,10 @@ describe('Ignore Utils', () => {
     const ignoreExts = new Set(['jpg', 'log']);
     const gitignoreRules = ['*.tmp', 'secret/'];
 
-    expect(
-      shouldIgnoreItem('node_modules', 'node_modules', true, ignoreDirs, ignoreExts, gitignoreRules)
-    ).toBe(true);
-    expect(
-      shouldIgnoreItem('photo.jpg', 'photo.jpg', false, ignoreDirs, ignoreExts, gitignoreRules)
-    ).toBe(true);
-    expect(
-      shouldIgnoreItem('debug.tmp', 'debug.tmp', false, ignoreDirs, ignoreExts, gitignoreRules)
-    ).toBe(true);
-    expect(
-      shouldIgnoreItem('photo.png', 'photo.png', false, ignoreDirs, ignoreExts, gitignoreRules)
-    ).toBe(false);
+    expect(shouldIgnoreItem('node_modules', 'node_modules', true, ignoreDirs, ignoreExts, gitignoreRules)).toBe(true);
+    expect(shouldIgnoreItem('photo.jpg', 'photo.jpg', false, ignoreDirs, ignoreExts, gitignoreRules)).toBe(true);
+    expect(shouldIgnoreItem('debug.tmp', 'debug.tmp', false, ignoreDirs, ignoreExts, gitignoreRules)).toBe(true);
+    expect(shouldIgnoreItem('photo.png', 'photo.png', false, ignoreDirs, ignoreExts, gitignoreRules)).toBe(false);
   });
 });
 
@@ -155,7 +147,6 @@ describe('Encoder & Decoder Round-Trip Test (Real Images Zip Archive)', () => {
   const imagesRestoredDir = join(import.meta.dir, 'fixtures/images-restored');
 
   beforeAll(async () => {
-    // Unzip images.zip into test/extracted-images before test runs
     if (await Bun.file(imagesZipPath).exists()) {
       await mkdir(imagesDir, { recursive: true });
       Bun.spawnSync(['unzip', '-q', '-o', imagesZipPath, '-d', imagesDir]);
@@ -163,7 +154,6 @@ describe('Encoder & Decoder Round-Trip Test (Real Images Zip Archive)', () => {
   });
 
   afterAll(async () => {
-    // Clean up temporary extracted directory and chunks
     await rm(imagesDir, { recursive: true, force: true });
     await rm(imagesChunkDir, { recursive: true, force: true });
     await rm(imagesRestoredDir, { recursive: true, force: true });
@@ -198,6 +188,50 @@ describe('Encoder & Decoder Round-Trip Test (Real Images Zip Archive)', () => {
       expect(restoredHash).toBe(originalHash);
       expect(restoredHash).toBe(fileEntry.sha256);
     }
+  });
+
+  test('performs best-effort partial extraction when a chunk archive is missing', async () => {
+    const missingChunkOutputDir = join(import.meta.dir, 'fixtures/missing-chunk-test');
+    const missingChunkRestoredDir = join(import.meta.dir, 'fixtures/missing-chunk-restored');
+
+    const manifest = await encodeBackup({
+      inputDir: imagesDir,
+      outputDir: missingChunkOutputDir,
+      minSizeBytes: 3 * 1024 * 1024,
+      maxSizeBytes: 5 * 1024 * 1024,
+      prefix: 'partial_chunk_',
+      compress: true,
+    });
+
+    // Delete chunk #2
+    const chunk2Meta = manifest.chunks.find((c) => c.index === 2);
+    expect(chunk2Meta).toBeDefined();
+
+    if (chunk2Meta) {
+      const chunk2Path = join(missingChunkOutputDir, chunk2Meta.filename);
+      await unlink(chunk2Path);
+    }
+
+    // Expect decodeBackup to extract healthy files from chunk 1 & remaining chunks, but throw an error at summary
+    expect(
+      decodeBackup({
+        inputDir: missingChunkOutputDir,
+        outputDir: missingChunkRestoredDir,
+        verify: true,
+      })
+    ).rejects.toThrow();
+
+    // Verify healthy files from chunk 1 were extracted successfully
+    const chunk1Files = manifest.files.filter((f) => f.parts.every((p) => p.chunkIndex === 1));
+    expect(chunk1Files.length).toBeGreaterThan(0);
+
+    for (const healthyFile of chunk1Files) {
+      const restoredPath = join(missingChunkRestoredDir, healthyFile.relativePath);
+      expect(await Bun.file(restoredPath).exists()).toBe(true);
+    }
+
+    await rm(missingChunkOutputDir, { recursive: true, force: true });
+    await rm(missingChunkRestoredDir, { recursive: true, force: true });
   });
 
   test('filters out files by extension (--ignore-ext jpg)', async () => {
