@@ -2,6 +2,7 @@ import { mkdir, readdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import type { Manifest, FileEntry } from './types/manifest.ts';
 import { computeFileHash } from './utils/hash-utils.ts';
+import { sanitizePathForOS, resolveCaseCollision } from './utils/path-utils.ts';
 
 export interface DecodeOptions {
   inputDir: string;
@@ -50,7 +51,7 @@ async function loadManifest(inputDir: string): Promise<Manifest> {
 
 /**
  * Performs best-effort decoding of a backup, extracting all healthy files from available chunks,
- * verifying checksums, and reporting any missing or corrupted files.
+ * applying cross-platform path sanitization, verifying checksums, and reporting results.
  *
  * @param options Decode configuration options
  */
@@ -72,19 +73,25 @@ export async function decodeBackup(options: DecodeOptions): Promise<void> {
     const chunkFile = Bun.file(chunkPath);
 
     if (await chunkFile.exists()) {
-      console.log(`[INFO] Reading Chunk ${chunkMeta.index}/${manifest.chunkCount}: ${chunkMeta.filename}...`);
+      console.log(
+        `[INFO] Reading Chunk ${chunkMeta.index}/${manifest.chunkCount}: ${chunkMeta.filename}...`
+      );
       const archiveBytes = await chunkFile.bytes();
       const archive = new Bun.Archive(archiveBytes);
       const files = await archive.files();
       chunkFilesMap.set(chunkMeta.index, files);
     } else {
-      console.warn(`[WARN] Missing chunk archive: "${chunkMeta.filename}". Files in this chunk will be skipped.`);
+      console.warn(
+        `[WARN] Missing chunk archive: "${chunkMeta.filename}". Files in this chunk will be skipped.`
+      );
       missingChunkIndices.add(chunkMeta.index);
     }
   }
 
   if (chunkFilesMap.size === 0) {
-    throw new Error(`No valid chunk archive files found in "${inputDir}". Cannot extract any files.`);
+    throw new Error(
+      `No valid chunk archive files found in "${inputDir}". Cannot extract any files.`
+    );
   }
 
   await mkdir(outputDir, { recursive: true });
@@ -93,22 +100,38 @@ export async function decodeBackup(options: DecodeOptions): Promise<void> {
 
   let restoredCount = 0;
   let skippedCount = 0;
-  const extractedFilesList: FileEntry[] = [];
+  const extractedFilesList: { entry: FileEntry; finalPath: string }[] = [];
+  const extractedCaseMap = new Map<string, string>();
 
   for (const fileEntry of manifest.files) {
     const sortedParts = [...fileEntry.parts].sort((a, b) => a.startByte - b.startByte);
 
     const hasMissingPart = sortedParts.some(
-      (part) => missingChunkIndices.has(part.chunkIndex) || !chunkFilesMap.get(part.chunkIndex)?.has(part.internalPath)
+      (part) =>
+        missingChunkIndices.has(part.chunkIndex) ||
+        !chunkFilesMap.get(part.chunkIndex)?.has(part.internalPath)
     );
 
     if (hasMissingPart) {
-      console.warn(`[WARN] Skipping "${fileEntry.relativePath}": one or more chunk parts are missing.`);
+      console.warn(
+        `[WARN] Skipping "${fileEntry.relativePath}": one or more chunk parts are missing.`
+      );
       skippedCount++;
       continue;
     }
 
-    const targetPath = join(outputDir, fileEntry.relativePath);
+    const { sanitizedPath, wasSanitized } = sanitizePathForOS(fileEntry.relativePath);
+    const { finalPath, hadCollision } = resolveCaseCollision(sanitizedPath, extractedCaseMap);
+
+    if (wasSanitized) {
+      console.warn(
+        `[WARN] Sanitized Windows-invalid path: "${fileEntry.relativePath}" -> "${finalPath}"`
+      );
+    } else if (hadCollision) {
+      console.warn(`[WARN] Resolved case collision: "${fileEntry.relativePath}" -> "${finalPath}"`);
+    }
+
+    const targetPath = join(outputDir, finalPath);
     await mkdir(dirname(targetPath), { recursive: true });
 
     if (
@@ -123,7 +146,7 @@ export async function decodeBackup(options: DecodeOptions): Promise<void> {
       if (fileBlob) {
         await Bun.write(targetPath, fileBlob);
         restoredCount++;
-        extractedFilesList.push(fileEntry);
+        extractedFilesList.push({ entry: fileEntry, finalPath });
       }
     } else {
       const fileWriter = Bun.file(targetPath).writer();
@@ -146,7 +169,7 @@ export async function decodeBackup(options: DecodeOptions): Promise<void> {
 
       if (assembleSuccess) {
         restoredCount++;
-        extractedFilesList.push(fileEntry);
+        extractedFilesList.push({ entry: fileEntry, finalPath });
       } else {
         console.warn(`[WARN] Failed reassembling split slices for "${fileEntry.relativePath}".`);
         skippedCount++;
@@ -158,17 +181,19 @@ export async function decodeBackup(options: DecodeOptions): Promise<void> {
   let corruptedCount = 0;
 
   if (verify && extractedFilesList.length > 0) {
-    console.log(`[INFO] Verifying SHA-256 integrity checksums for ${extractedFilesList.length} restored files...`);
+    console.log(
+      `[INFO] Verifying SHA-256 integrity checksums for ${extractedFilesList.length} restored files...`
+    );
 
-    for (const fileEntry of extractedFilesList) {
-      const targetPath = join(outputDir, fileEntry.relativePath);
+    for (const item of extractedFilesList) {
+      const targetPath = join(outputDir, item.finalPath);
       const computedHash = await computeFileHash(targetPath);
 
-      if (computedHash === fileEntry.sha256) {
+      if (computedHash === item.entry.sha256) {
         verifiedCount++;
       } else {
         console.error(
-          `[ERROR] Checksum mismatch for "${fileEntry.relativePath}"! Expected ${fileEntry.sha256}, got ${computedHash}`
+          `[ERROR] Checksum mismatch for "${item.entry.relativePath}"! Expected ${item.entry.sha256}, got ${computedHash}`
         );
         corruptedCount++;
       }
@@ -190,5 +215,7 @@ export async function decodeBackup(options: DecodeOptions): Promise<void> {
     );
   }
 
-  console.log(`[SUCCESS] All ${verifiedCount} files restored and SHA-256 checksums verified successfully!`);
+  console.log(
+    `[SUCCESS] All ${verifiedCount} files restored and SHA-256 checksums verified successfully!`
+  );
 }
