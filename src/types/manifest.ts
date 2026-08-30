@@ -3,9 +3,9 @@
  */
 export interface FilePart {
   chunkIndex: number;
-  internalPath: string;
-  startByte: number;
-  endByte: number;
+  internalPath?: string;
+  startByte?: number;
+  endByte?: number;
 }
 
 /**
@@ -38,6 +38,7 @@ export interface Manifest {
   totalFiles: number;
   totalSizeBytes: number;
   chunkCount: number;
+  encrypted?: boolean;
   chunks: ChunkMetadata[];
   files: FileEntry[];
 }
