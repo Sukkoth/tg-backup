@@ -1,148 +1,116 @@
 # tg-backup
 
-> **Fast, intelligent folder compression and archiving CLI tool powered by Bun & TypeScript.**
+> High-performance, chunk-splitting backup CLI engine powered by **Bun** and **TypeScript**.
 
-`tg-backup` chunks and compresses large directories into size-bounded archives (e.g., 3 GB – 4 GB) optimized for cloud storage and messaging uploads. It features **smart bin-packing**, **large file slicing**, **SHA-256 integrity verification**, and automatic **`.gitignore` support**.
+`tg-backup` splits large folders into size-bounded chunk archives (`.tar.gz`) with SHA-256 checksum verification, stream slicing, best-effort disaster recovery, cross-platform path sanitization, and optional **AES-256-GCM encryption**.
 
 ---
 
-## Key Features
+## Features
 
-- ⚡ **Bun Native Engine**: Powered by `Bun.Archive` and streaming `Bun.CryptoHasher` for lightning-fast archiving and hashing.
-- 📦 **Bin-Packing & Slicing**: Packs files into target chunk boundaries (e.g. min 3 GB, max 4 GB). Files larger than the maximum chunk size are sliced across chunk boundaries seamlessly.
-- 🔐 **Self-Describing Manifest**: Embeds a `manifest.json` blueprint inside every chunk archive, mapping file paths, byte slice offsets, and original SHA-256 checksums.
-- ✅ **Automated Integrity Verification**: `decode` automatically verifies SHA-256 hashes for every restored file to guarantee zero data loss.
-- 🛡️ **Smart Exclusions**: Ignores `node_modules` and `.git` by default, supports custom file extension filtering (`-e jpg,png`), and respects `.gitignore` rules.
-- 🔄 **Full Round-Trip CLI**: Clean `encode` and `decode` subcommands.
+- **Dynamic Chunk Allocation & Bin-Packing**: Automatically packs files into chunk archives within target bounds (e.g. `3GB` - `4GB`).
+- **Stream Slicing**: Large files exceeding max chunk size are sliced losslessly across chunk boundaries without high memory usage.
+- **AES-256-GCM Encryption (`--password`)**: Optional passphrase encryption using PBKDF2 key derivation and WebCrypto.
+- **Best-Effort Partial Recovery**: If a chunk archive is missing during extraction, `tg-backup` restores all healthy files, reports skipped/corrupted files, and exits with code `1`.
+- **In-Place Verification (`verify` command)**: Check archive integrity directly on disk without extracting files.
+- **Dry-Run Mode (`--dry-run`)**: Preview file counts, total size, and planned chunk allocation without writing disk files.
+- **Cross-Platform Path Sanitization**: Automatically encodes Windows-illegal filename characters (`: * ? " < > |`) and resolves case-sensitivity collisions.
+- **Embedded & Standalone Manifests**: `manifest.json` is saved in the output directory **and** embedded inside every `.tar.gz` chunk archive for self-describing recovery.
 
 ---
 
 ## Installation
 
-Ensure you have [Bun](https://bun.sh) installed (version 1.0 or higher).
-
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/tg-backup.git
+git clone https://github.com/Sukkoth/tg-backup.git
 cd tg-backup
 
 # Install dependencies
 bun install
-
-# Link executable globally (optional)
-bun link
 ```
 
 ---
 
-## Quickstart
+## Quick Start & Usage
 
-### 1. Create a Backup (Encode)
-
-Compress a folder into split chunk archives (max 4 GB per chunk, target min 3 GB):
+### 1. Encode (Create Backup Chunks)
 
 ```bash
-bun run src/index.ts encode -i ./my_photos -o ./backup_output -m 4G --min-size 3G
+# Encode directory into 500MB - 1GB compressed chunk archives
+bun start encode -i ./my-folder -o ./backup-chunks --min-size 500M -m 1G
 ```
 
-### 2. Restore a Backup (Decode)
-
-Extract chunk archives back to their original folder structure and verify SHA-256 checksums:
+#### Password Encrypted Backup
 
 ```bash
-bun run src/index.ts decode -i ./backup_output -o ./restored_photos
+bun start encode -i ./secret-photos -o ./encrypted-backup --password "MySecretPassphrase!"
+```
+
+#### Dry-Run Mode (Preview Allocation)
+
+```bash
+bun start encode -i ./large-dataset -o ./output --dry-run
 ```
 
 ---
 
-## CLI Reference & Options
-
-```text
-Usage: tg-backup [command] [options]
-
-Commands:
-  encode               Compress directory into split chunk archives (default)
-  decode               Decompress split chunk archives & verify checksums
-```
-
-### Encode Options
-
-| Flag                  | Short | Description                                            | Default             |
-| :-------------------- | :---- | :----------------------------------------------------- | :------------------ |
-| `--input <path>`      | `-i`  | Target directory to compress                           | `./`                |
-| `--output <path>`     | `-o`  | Destination directory for output chunks                | `./output`          |
-| `--max-size <size>`   | `-m`  | Maximum chunk archive size (e.g. `4G`, `500M`)         | `4G`                |
-| `--min-size <size>`   |       | Minimum target chunk size (e.g. `3G`, `250M`)          | `3G`                |
-| `--prefix <name>`     | `-p`  | Output filename prefix for chunks                      | `chunk_`            |
-| `--ignore-dir <dirs>` | `-d`  | Comma-separated directory names to ignore              | `node_modules,.git` |
-| `--ignore-ext <exts>` | `-e`  | Comma-separated file extensions to ignore              | _(none)_            |
-| `--no-gitignore`      |       | Disable `.gitignore` rule evaluation                   | `false`             |
-| `--no-compress`       |       | Create uncompressed `.tar` chunks instead of `.tar.gz` | `false`             |
-| `--version`           | `-v`  | Display version number                                 |                     |
-| `--help`              | `-h`  | Display help documentation                             |                     |
-
-### Decode Options
-
-| Flag              | Short | Description                                           | Default    |
-| :---------------- | :---- | :---------------------------------------------------- | :--------- |
-| `--input <path>`  | `-i`  | Directory containing chunk archives & `manifest.json` | `./`       |
-| `--output <path>` | `-o`  | Target directory for restored files                   | `./output` |
-| `--no-verify`     |       | Skip SHA-256 checksum verification step               | `false`    |
-
----
-
-## Advanced Usage Examples
-
-### Custom Size Boundaries (e.g., 500 MB Chunks)
+### 2. Decode (Restore Backup)
 
 ```bash
-tg-backup encode -i ./large_dataset -o ./chunks -m 500M --min-size 300M
+# Restore files and verify SHA-256 integrity
+bun start decode -i ./backup-chunks -o ./restored-folder
 ```
 
-### Exclude Media Extensions & Specific Folders
+#### Decrypt Encrypted Backup
 
 ```bash
-tg-backup encode -i ./workspace -o ./chunks -d node_modules,.git,dist -e jpg,png,mp4
-```
-
-### Decode without Integrity Check (Fast Restore)
-
-```bash
-tg-backup decode -i ./chunks -o ./restored --no-verify
+bun start decode -i ./encrypted-backup -o ./restored-folder --password "MySecretPassphrase!"
 ```
 
 ---
 
-## How It Works
+### 3. Verify Backup In-Place
 
-### Bin-Packing & Large File Slicing Algorithm
-
-1. **Directory Traversal**: Scans the source directory recursively, applying ignore filters and `.gitignore` rules.
-2. **SHA-256 Hashing**: Computes streaming SHA-256 hashes using `Bun.CryptoHasher`.
-3. **Batch Accumulation**: Files are accumulated into a chunk batch until the size falls within `[min-size, max-size]`.
-4. **Large File Slicing**: If a single file exceeds `max-size`, it is stream-sliced across consecutive chunks (`file.part001`, `file.part002`).
-5. **Archive Generation**: Generates compressed `.tar.gz` archives using `Bun.Archive` and embeds `manifest.json` into every chunk.
-
+```bash
+# Verify chunk archive integrity in-place without extracting files to disk
+bun start verify -i ./backup-chunks
 ```
-[ Input Directory ] ---> [ Scanner & Hasher ] ---> [ Bin-Packer & Slicer ]
-                                                             |
-                                                             v
-                                        [ chunk_001.tar.gz ] [ chunk_002.tar.gz ]
-                                        (with manifest.json embedded in each)
-```
+
+---
+
+## CLI Options
+
+| Flag / Option             | Description                                                          | Command                      |
+| :------------------------ | :------------------------------------------------------------------- | :--------------------------- |
+| `-i, --input <path>`      | Input directory (default: `./`)                                      | `encode`, `decode`, `verify` |
+| `-o, --output <path>`     | Output directory (default: `./output`)                               | `encode`, `decode`           |
+| `-m, --max-size <size>`   | Maximum chunk size limit (e.g. `4G`, `500M`)                         | `encode`                     |
+| `--min-size <size>`       | Minimum target chunk size (default: `3G`)                            | `encode`                     |
+| `-k, --password <pass>`   | AES-256-GCM encryption/decryption passphrase                         | `encode`, `decode`, `verify` |
+| `--dry-run`               | Preview file scan & allocation without writing disk archives         | `encode`                     |
+| `--no-progress`           | Disable live visual terminal progress bar                            | `encode`, `decode`, `verify` |
+| `-d, --ignore-dir <dirs>` | Comma-separated directories to ignore (default: `node_modules,.git`) | `encode`                     |
+| `-e, --ignore-ext <exts>` | Comma-separated file extensions to ignore (e.g. `jpg,png,mp4`)       | `encode`                     |
+| `--no-gitignore`          | Disable `.gitignore` rule processing                                 | `encode`                     |
+| `--no-compress`           | Create `.tar` archives without Gzip compression                      | `encode`                     |
+| `--no-verify`             | Skip SHA-256 checksum verification step                              | `decode`                     |
 
 ---
 
 ## Development & Testing
 
 ```bash
-# Run unit & end-to-end integration tests
+# Run unit & integration tests
 bun test
 
-# Run TypeScript type check (tsc --noEmit)
+# Run test coverage
+bun test --coverage
+
+# Typecheck TypeScript files
 bun run typecheck
 
-# Run Prettier code formatting
+# Format code with Prettier
 bun run format
 ```
 
@@ -150,4 +118,4 @@ bun run format
 
 ## License
 
-[MIT](LICENSE)
+MIT
