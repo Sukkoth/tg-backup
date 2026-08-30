@@ -50,7 +50,6 @@ Always choose APIs in this order:
 
 The goal is to write code the **Bun way**, rather than Node.js code that merely happens to run on Bun.
 
-
 ## General Engineering Rules
 
 ### Existing Code
