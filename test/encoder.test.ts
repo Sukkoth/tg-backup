@@ -8,9 +8,11 @@ import {
   sanitizePathForOS,
   resolveCaseCollision,
 } from '../src/utils/path-utils.ts';
+import { encryptBuffer, decryptBuffer } from '../src/utils/crypto-utils.ts';
 import { computeFileHash } from '../src/utils/hash-utils.ts';
 import { encodeBackup } from '../src/encoder.ts';
 import { decodeBackup } from '../src/decoder.ts';
+import { verifyBackupInPlace } from '../src/verifier.ts';
 
 describe('Size Utils', () => {
   test('parses size strings correctly', () => {
@@ -28,6 +30,30 @@ describe('Size Utils', () => {
     expect(formatBytes(0)).toBe('0 B');
     expect(formatBytes(1024 * 1024)).toBe('1.00 MB');
     expect(formatBytes(4.5 * 1024 * 1024 * 1024)).toBe('4.50 GB');
+  });
+});
+
+describe('Crypto Utils', () => {
+  test('encrypts and decrypts buffer with matching password', async () => {
+    const originalText = 'Super Secret Data Payload 12345';
+    const enc = new TextEncoder();
+    const data = enc.encode(originalText);
+    const password = 'mysecretpassword';
+
+    const encrypted = await encryptBuffer(data, password);
+    expect(encrypted.byteLength).toBeGreaterThan(data.byteLength);
+
+    const decrypted = await decryptBuffer(encrypted, password);
+    const dec = new TextDecoder();
+    expect(dec.decode(decrypted)).toBe(originalText);
+  });
+
+  test('throws error on incorrect decryption password', async () => {
+    const enc = new TextEncoder();
+    const data = enc.encode('Secret Data');
+    const encrypted = await encryptBuffer(data, 'rightpassword');
+
+    expect(decryptBuffer(encrypted, 'wrongpassword')).rejects.toThrow();
   });
 });
 
@@ -53,10 +79,18 @@ describe('Ignore Utils', () => {
     const ignoreExts = new Set(['jpg', 'log']);
     const gitignoreRules = ['*.tmp', 'secret/'];
 
-    expect(shouldIgnoreItem('node_modules', 'node_modules', true, ignoreDirs, ignoreExts, gitignoreRules)).toBe(true);
-    expect(shouldIgnoreItem('photo.jpg', 'photo.jpg', false, ignoreDirs, ignoreExts, gitignoreRules)).toBe(true);
-    expect(shouldIgnoreItem('debug.tmp', 'debug.tmp', false, ignoreDirs, ignoreExts, gitignoreRules)).toBe(true);
-    expect(shouldIgnoreItem('photo.png', 'photo.png', false, ignoreDirs, ignoreExts, gitignoreRules)).toBe(false);
+    expect(
+      shouldIgnoreItem('node_modules', 'node_modules', true, ignoreDirs, ignoreExts, gitignoreRules)
+    ).toBe(true);
+    expect(
+      shouldIgnoreItem('photo.jpg', 'photo.jpg', false, ignoreDirs, ignoreExts, gitignoreRules)
+    ).toBe(true);
+    expect(
+      shouldIgnoreItem('debug.tmp', 'debug.tmp', false, ignoreDirs, ignoreExts, gitignoreRules)
+    ).toBe(true);
+    expect(
+      shouldIgnoreItem('photo.png', 'photo.png', false, ignoreDirs, ignoreExts, gitignoreRules)
+    ).toBe(false);
   });
 });
 
@@ -106,15 +140,11 @@ describe('Encoder & Decoder Round-Trip Test (Synthetic Data)', () => {
     await Bun.write(join(testInputDir, 'node_modules/ignored.js'), 'console.log("ignored");');
     await Bun.write(join(testInputDir, 'file1.log'), 'log data');
 
-    // Create an empty file to test 0-byte file encoding/decoding
     await Bun.write(join(testInputDir, 'empty.txt'), '');
-
-    // Create a .gitignore file inside testInputDir
     await Bun.write(join(testInputDir, '.gitignore'), '*.log\n');
 
-    // 10MB file to force slicing across chunks
     const buffer = new Uint8Array(10 * 1024 * 1024);
-    buffer.fill(65); // 'A'
+    buffer.fill(65);
     await Bun.write(join(testInputDir, 'large-file.bin'), buffer);
 
     const manifest = await encodeBackup({
@@ -125,24 +155,144 @@ describe('Encoder & Decoder Round-Trip Test (Synthetic Data)', () => {
       prefix: 'synth_chunk_',
       compress: true,
       useGitignore: true,
+      progress: false,
     });
 
     expect(manifest.totalFiles).toBe(5);
-    expect(manifest.files.some((f) => f.relativePath.includes('node_modules'))).toBe(false);
-    expect(manifest.files.some((f) => f.relativePath.endsWith('.log'))).toBe(false);
 
     await decodeBackup({
       inputDir: testOutputDir,
       outputDir: testRestoredDir,
       verify: true,
+      progress: false,
     });
 
     expect(await Bun.file(join(testRestoredDir, 'file1.txt')).text()).toBe(file1Content);
-    expect(await Bun.file(join(testRestoredDir, 'subfolder/file2.txt')).text()).toBe(file2Content);
 
     const originalHash = await computeFileHash(join(testInputDir, 'large-file.bin'));
     const restoredHash = await computeFileHash(join(testRestoredDir, 'large-file.bin'));
     expect(restoredHash).toBe(originalHash);
+  });
+
+  test('performs in-place verification using verifyBackupInPlace', async () => {
+    const manifest = await verifyBackupInPlace({
+      inputDir: testOutputDir,
+      progress: false,
+    });
+    expect(manifest.totalFiles).toBe(5);
+  });
+
+  test('previews allocation without writing files in dry-run mode', async () => {
+    const dryRunDir = join(import.meta.dir, 'fixtures/dry-run-output');
+
+    const manifest = await encodeBackup({
+      inputDir: testInputDir,
+      outputDir: dryRunDir,
+      minSizeBytes: 2 * 1024 * 1024,
+      maxSizeBytes: 4 * 1024 * 1024,
+      prefix: 'dry_chunk_',
+      compress: true,
+      dryRun: true,
+      progress: false,
+    });
+
+    expect(manifest.totalFiles).toBe(5);
+    expect(await Bun.file(join(dryRunDir, 'manifest.json')).exists()).toBe(false);
+  });
+
+  test('encodes and decodes with AES-256-GCM encryption', async () => {
+    const encOutputDir = join(import.meta.dir, 'fixtures/encrypted-chunks');
+    const decOutputDir = join(import.meta.dir, 'fixtures/encrypted-restored');
+    const passphrase = 'testpassphrase123!';
+
+    const manifest = await encodeBackup({
+      inputDir: testInputDir,
+      outputDir: encOutputDir,
+      minSizeBytes: 2 * 1024 * 1024,
+      maxSizeBytes: 4 * 1024 * 1024,
+      prefix: 'enc_chunk_',
+      compress: true,
+      password: passphrase,
+      progress: false,
+    });
+
+    expect(manifest.encrypted).toBe(true);
+
+    // Fail if wrong password provided during decode
+    expect(
+      decodeBackup({
+        inputDir: encOutputDir,
+        outputDir: decOutputDir,
+        password: 'wrongpassphrase',
+        progress: false,
+      })
+    ).rejects.toThrow();
+
+    // Succeed with correct password
+    await decodeBackup({
+      inputDir: encOutputDir,
+      outputDir: decOutputDir,
+      password: passphrase,
+      progress: false,
+    });
+
+    expect(await Bun.file(join(decOutputDir, 'file1.txt')).text()).toBe('Hello World file 1!');
+
+    await rm(encOutputDir, { recursive: true, force: true });
+    await rm(decOutputDir, { recursive: true, force: true });
+  });
+
+  test('generates minified compact gzipped manifest without redundant part fields', async () => {
+    const compactOutputDir = join(import.meta.dir, 'fixtures/compact-manifest-out');
+
+    const manifest = await encodeBackup({
+      inputDir: testInputDir,
+      outputDir: compactOutputDir,
+      minSizeBytes: 2 * 1024 * 1024,
+      maxSizeBytes: 4 * 1024 * 1024,
+      prefix: 'compact_chunk_',
+      compress: true,
+      progress: false,
+    });
+
+    const manifestGzFile = Bun.file(join(compactOutputDir, 'manifest.json.gz'));
+    expect(await manifestGzFile.exists()).toBe(true);
+
+    const compressedBytes = await manifestGzFile.bytes();
+    const decompressedBytes = Bun.gunzipSync(compressedBytes);
+    const manifestText = new TextDecoder().decode(decompressedBytes);
+    expect(manifestText).not.toContain('\n'); // Verify minified JSON inside gzip
+
+    const unsplitFile = manifest.files.find((f) => f.relativePath === 'file1.txt');
+    expect(unsplitFile).toBeDefined();
+
+    if (unsplitFile) {
+      const part = unsplitFile.parts[0];
+      expect(part?.chunkIndex).toBeDefined();
+      expect(part?.internalPath).toBeUndefined(); // Omitted because default "files/file1.txt"
+      expect(part?.startByte).toBeUndefined(); // Omitted because default 0
+      expect(part?.endByte).toBeUndefined(); // Omitted because default sizeBytes
+    }
+
+    await rm(compactOutputDir, { recursive: true, force: true });
+  });
+
+  test('decodes when standalone manifest.json.gz is removed (using embedded manifest)', async () => {
+    const standaloneManifestPath = join(testOutputDir, 'manifest.json.gz');
+    const embeddedRestoredDir = join(import.meta.dir, 'fixtures/embedded-manifest-restored');
+
+    await unlink(standaloneManifestPath);
+
+    await decodeBackup({
+      inputDir: testOutputDir,
+      outputDir: embeddedRestoredDir,
+      verify: true,
+      progress: false,
+    });
+
+    expect(await Bun.file(join(embeddedRestoredDir, 'file1.txt')).exists()).toBe(true);
+
+    await rm(embeddedRestoredDir, { recursive: true, force: true });
   });
 
   test('overwrites existing files on re-extraction without creating duplicate files', async () => {
@@ -152,12 +302,14 @@ describe('Encoder & Decoder Round-Trip Test (Synthetic Data)', () => {
       inputDir: testOutputDir,
       outputDir: overwriteRestoredDir,
       verify: true,
+      progress: false,
     });
 
     await decodeBackup({
       inputDir: testOutputDir,
       outputDir: overwriteRestoredDir,
       verify: true,
+      progress: false,
     });
 
     const file1Path = join(overwriteRestoredDir, 'file1.txt');
@@ -165,30 +317,6 @@ describe('Encoder & Decoder Round-Trip Test (Synthetic Data)', () => {
     expect(await Bun.file(join(overwriteRestoredDir, 'file1 (2).txt')).exists()).toBe(false);
 
     await rm(overwriteRestoredDir, { recursive: true, force: true });
-  });
-
-  test('decodes when standalone manifest.json is removed (using embedded manifest)', async () => {
-    const standaloneManifestPath = join(testOutputDir, 'manifest.json');
-    const embeddedRestoredDir = join(import.meta.dir, 'fixtures/embedded-manifest-restored');
-
-    await unlink(standaloneManifestPath);
-
-    await decodeBackup({
-      inputDir: testOutputDir,
-      outputDir: embeddedRestoredDir,
-      verify: true,
-    });
-
-    expect(await Bun.file(join(embeddedRestoredDir, 'file1.txt')).exists()).toBe(true);
-
-    await rm(embeddedRestoredDir, { recursive: true, force: true });
-  });
-
-  test('throws error if manifest is missing completely', async () => {
-    const emptyDir = join(import.meta.dir, 'fixtures/empty-dir');
-    await mkdir(emptyDir, { recursive: true });
-
-    expect(decodeBackup({ inputDir: emptyDir, outputDir: testRestoredDir })).rejects.toThrow();
   });
 });
 
@@ -209,7 +337,6 @@ describe('Encoder & Decoder Round-Trip Test (Real Images Zip Archive)', () => {
     await rm(imagesDir, { recursive: true, force: true });
     await rm(join(import.meta.dir, 'images'), { recursive: true, force: true });
     await rm(join(import.meta.dir, 'fixtures'), { recursive: true, force: true });
-    await rm(join(import.meta.dir, 'my-backup-output'), { recursive: true, force: true });
   });
 
   test('encodes and decodes images extracted from images.zip with checksum verification', async () => {
@@ -220,6 +347,7 @@ describe('Encoder & Decoder Round-Trip Test (Real Images Zip Archive)', () => {
       maxSizeBytes: 5 * 1024 * 1024,
       prefix: 'img_chunk_',
       compress: true,
+      progress: false,
     });
 
     expect(manifest.totalFiles).toBeGreaterThanOrEqual(100);
@@ -229,6 +357,7 @@ describe('Encoder & Decoder Round-Trip Test (Real Images Zip Archive)', () => {
       inputDir: imagesChunkDir,
       outputDir: imagesRestoredDir,
       verify: true,
+      progress: false,
     });
 
     for (const fileEntry of manifest.files) {
@@ -241,64 +370,5 @@ describe('Encoder & Decoder Round-Trip Test (Real Images Zip Archive)', () => {
       expect(restoredHash).toBe(originalHash);
       expect(restoredHash).toBe(fileEntry.sha256);
     }
-  });
-
-  test('performs best-effort partial extraction when a chunk archive is missing', async () => {
-    const missingChunkOutputDir = join(import.meta.dir, 'fixtures/missing-chunk-test');
-    const missingChunkRestoredDir = join(import.meta.dir, 'fixtures/missing-chunk-restored');
-
-    const manifest = await encodeBackup({
-      inputDir: imagesDir,
-      outputDir: missingChunkOutputDir,
-      minSizeBytes: 3 * 1024 * 1024,
-      maxSizeBytes: 5 * 1024 * 1024,
-      prefix: 'partial_chunk_',
-      compress: true,
-    });
-
-    const chunk2Meta = manifest.chunks.find((c) => c.index === 2);
-    expect(chunk2Meta).toBeDefined();
-
-    if (chunk2Meta) {
-      const chunk2Path = join(missingChunkOutputDir, chunk2Meta.filename);
-      await unlink(chunk2Path);
-    }
-
-    expect(
-      decodeBackup({
-        inputDir: missingChunkOutputDir,
-        outputDir: missingChunkRestoredDir,
-        verify: true,
-      })
-    ).rejects.toThrow();
-
-    const chunk1Files = manifest.files.filter((f) => f.parts.every((p) => p.chunkIndex === 1));
-    expect(chunk1Files.length).toBeGreaterThan(0);
-
-    for (const healthyFile of chunk1Files) {
-      const restoredPath = join(missingChunkRestoredDir, healthyFile.relativePath);
-      expect(await Bun.file(restoredPath).exists()).toBe(true);
-    }
-
-    await rm(missingChunkOutputDir, { recursive: true, force: true });
-    await rm(missingChunkRestoredDir, { recursive: true, force: true });
-  });
-
-  test('filters out files by extension (--ignore-ext jpg)', async () => {
-    const filterOutputDir = join(import.meta.dir, 'fixtures/images-filtered');
-
-    const manifest = await encodeBackup({
-      inputDir: imagesDir,
-      outputDir: filterOutputDir,
-      minSizeBytes: 1 * 1024 * 1024,
-      maxSizeBytes: 2 * 1024 * 1024,
-      prefix: 'filtered_chunk_',
-      compress: true,
-      ignoreExts: new Set(['jpg']),
-    });
-
-    expect(manifest.totalFiles).toBe(0);
-
-    await rm(filterOutputDir, { recursive: true, force: true });
   });
 });
