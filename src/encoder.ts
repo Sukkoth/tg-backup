@@ -4,6 +4,8 @@ import type { FileEntry, FilePart, Manifest, ChunkMetadata } from './types/manif
 import { computeFileHash } from './utils/hash-utils.ts';
 import { formatBytes } from './utils/size-utils.ts';
 import { loadGitignoreRules, shouldIgnoreItem } from './utils/ignore-utils.ts';
+import { encryptBuffer } from './utils/crypto-utils.ts';
+import { ProgressBar } from './utils/progress-utils.ts';
 
 export interface EncodeOptions {
   inputDir: string;
@@ -15,6 +17,9 @@ export interface EncodeOptions {
   ignoreDirs?: Set<string>;
   ignoreExts?: Set<string>;
   useGitignore?: boolean;
+  password?: string;
+  dryRun?: boolean;
+  progress?: boolean;
 }
 
 interface InternalFilePart {
@@ -39,18 +44,22 @@ interface ChunkBatch {
  * @param ignoreDirs Set of directory names to skip
  * @param ignoreExts Set of file extensions to skip
  * @param useGitignore Whether to read and evaluate .gitignore rules
+ * @param showProgress Whether to show terminal progress updates
  * @returns Array of file entry definitions with hashes
  */
 async function scanInputDirectory(
   inputDir: string,
   ignoreDirs: Set<string> = new Set(['node_modules', '.git']),
   ignoreExts: Set<string> = new Set(),
-  useGitignore: boolean = true
+  useGitignore: boolean = true,
+  showProgress: boolean = true
 ): Promise<{ fullPath: string; entry: FileEntry }[]> {
   const entries: { fullPath: string; entry: FileEntry }[] = [];
   const gitignoreRules = useGitignore ? await loadGitignoreRules(inputDir) : [];
 
-  async function walk(currentDir: string): Promise<void> {
+  const rawFileList: { fullPath: string; relPath: string }[] = [];
+
+  async function collect(currentDir: string): Promise<void> {
     const dirEntries = await readdir(currentDir, { withFileTypes: true });
 
     for (const item of dirEntries) {
@@ -63,26 +72,37 @@ async function scanInputDirectory(
       }
 
       if (isDir) {
-        await walk(fullPath);
+        await collect(fullPath);
       } else if (item.isFile()) {
-        const bunFile = Bun.file(fullPath);
-        const sizeBytes = bunFile.size;
-        const sha256 = await computeFileHash(fullPath);
-
-        entries.push({
-          fullPath,
-          entry: {
-            relativePath: relPath,
-            sizeBytes,
-            sha256,
-            parts: [],
-          },
-        });
+        rawFileList.push({ fullPath, relPath });
       }
     }
   }
 
-  await walk(inputDir);
+  await collect(inputDir);
+
+  const progressBar = new ProgressBar('Scanning & Hashing files', rawFileList.length, showProgress);
+
+  for (let i = 0; i < rawFileList.length; i++) {
+    const { fullPath, relPath } = rawFileList[i]!;
+    const bunFile = Bun.file(fullPath);
+    const sizeBytes = bunFile.size;
+    const sha256 = await computeFileHash(fullPath);
+
+    entries.push({
+      fullPath,
+      entry: {
+        relativePath: relPath,
+        sizeBytes,
+        sha256,
+        parts: [],
+      },
+    });
+
+    progressBar.update(i + 1);
+  }
+
+  progressBar.finish();
   return entries;
 }
 
@@ -175,53 +195,108 @@ function planChunkBatches(
  * @param options Encoding configuration parameters
  */
 export async function encodeBackup(options: EncodeOptions): Promise<Manifest> {
-  const { inputDir, outputDir, minSizeBytes, maxSizeBytes, prefix, compress } = options;
+  const {
+    inputDir,
+    outputDir,
+    minSizeBytes,
+    maxSizeBytes,
+    prefix,
+    compress,
+    password,
+    dryRun = false,
+    progress = true,
+  } = options;
 
   console.log(`[INFO] Scanning directory: ${inputDir}`);
   const scannedItems = await scanInputDirectory(
     inputDir,
     options.ignoreDirs,
     options.ignoreExts,
-    options.useGitignore
+    options.useGitignore,
+    progress
   );
 
   if (scannedItems.length === 0) {
     console.log(`[WARN] Input directory "${inputDir}" contains no matching files.`);
-    await mkdir(outputDir, { recursive: true });
-    const manifestPath = join(outputDir, 'manifest.json');
-    const emptyManifest: Manifest = {
-      version: '1.0.0',
-      backupId: `backup-${Date.now()}`,
-      createdAt: new Date().toISOString(),
-      totalFiles: 0,
-      totalSizeBytes: 0,
-      chunkCount: 0,
-      chunks: [],
-      files: [],
-    };
-    await Bun.write(manifestPath, JSON.stringify(emptyManifest, null, 2));
-    return emptyManifest;
+    if (!dryRun) {
+      await mkdir(outputDir, { recursive: true });
+      const manifestPathGz = join(outputDir, 'manifest.json.gz');
+      const emptyManifest: Manifest = {
+        version: '1.0.0',
+        backupId: `backup-${Date.now()}`,
+        createdAt: new Date().toISOString(),
+        totalFiles: 0,
+        totalSizeBytes: 0,
+        chunkCount: 0,
+        encrypted: !!password,
+        chunks: [],
+        files: [],
+      };
+      const jsonBytes = new TextEncoder().encode(JSON.stringify(emptyManifest));
+      await Bun.write(manifestPathGz, Bun.gzipSync(jsonBytes));
+      return emptyManifest;
+    }
   }
 
   console.log(`[INFO] Found ${scannedItems.length} files. Planning chunk batches...`);
   const batches = planChunkBatches(scannedItems, minSizeBytes, maxSizeBytes);
+  const totalSizeBytes = scannedItems.reduce((acc, item) => acc + item.entry.sizeBytes, 0);
+
+  if (dryRun) {
+    console.log(`--------------------------------------------------`);
+    console.log(`[DRY-RUN MODE] Planned Backup Allocation:`);
+    console.log(`  - Source Directory      : ${inputDir}`);
+    console.log(`  - Target Output Directory: ${outputDir}`);
+    console.log(`  - Total Matching Files  : ${scannedItems.length}`);
+    console.log(`  - Total Original Size   : ${formatBytes(totalSizeBytes)}`);
+    console.log(`  - Planned Chunk Count   : ${batches.length}`);
+    console.log(
+      `  - Target Chunk Bounds   : [${formatBytes(minSizeBytes)}, ${formatBytes(maxSizeBytes)}]`
+    );
+    console.log(`  - Encryption Enabled    : ${password ? 'YES (AES-256-GCM)' : 'NO'}`);
+    console.log(`--------------------------------------------------`);
+    console.log(`[INFO] Dry-run complete. No files were written to disk.`);
+
+    return {
+      version: '1.0.0',
+      backupId: `dry-run-${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      totalFiles: scannedItems.length,
+      totalSizeBytes,
+      chunkCount: batches.length,
+      encrypted: !!password,
+      chunks: batches.map((b) => ({
+        index: b.index,
+        filename: `${prefix}${String(b.index).padStart(3, '0')}${compress ? '.tar.gz' : '.tar'}`,
+        sizeBytes: b.totalBytes,
+        fileCount: b.parts.length,
+      })),
+      files: scannedItems.map((i) => i.entry),
+    };
+  }
 
   await mkdir(outputDir, { recursive: true });
 
   const backupId = `backup-${Date.now()}`;
-  const totalSizeBytes = scannedItems.reduce((acc, item) => acc + item.entry.sizeBytes, 0);
-
   const extension = compress ? '.tar.gz' : '.tar';
 
-  // Pre-populate all file parts across all batches in the manifest
   for (const batch of batches) {
     for (const part of batch.parts) {
+      const isDefaultPath = part.internalPath === `files/${part.entry.relativePath}`;
+      const isFullSlice = part.startByte === 0 && part.endByte === part.entry.sizeBytes;
+
       const filePartRecord: FilePart = {
         chunkIndex: batch.index,
-        internalPath: part.internalPath,
-        startByte: part.startByte,
-        endByte: part.endByte,
       };
+
+      if (!isDefaultPath) {
+        filePartRecord.internalPath = part.internalPath;
+      }
+      if (!isFullSlice) {
+        filePartRecord.startByte = part.startByte;
+        filePartRecord.endByte = part.endByte;
+      }
+
       part.entry.parts.push(filePartRecord);
     }
   }
@@ -240,17 +315,17 @@ export async function encodeBackup(options: EncodeOptions): Promise<Manifest> {
     totalFiles: scannedItems.length,
     totalSizeBytes,
     chunkCount: batches.length,
+    encrypted: !!password,
     chunks: manifestChunks,
     files: scannedItems.map((item) => item.entry),
   };
 
-  for (const batch of batches) {
+  const progressBar = new ProgressBar('Writing chunk archives', batches.length, progress);
+
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i]!;
     const chunkFilename = `${prefix}${String(batch.index).padStart(3, '0')}${extension}`;
     const chunkOutputPath = join(outputDir, chunkFilename);
-
-    console.log(
-      `[INFO] Writing Chunk ${batch.index}/${batches.length}: ${chunkFilename} (${formatBytes(batch.totalBytes)})...`
-    );
 
     const archiveRecords: Record<string, Blob | string | Uint8Array> = {};
 
@@ -263,12 +338,17 @@ export async function encodeBackup(options: EncodeOptions): Promise<Manifest> {
       archiveRecords[part.internalPath] = sliceBytes;
     }
 
-    archiveRecords['manifest.json'] = JSON.stringify(manifest, null, 2);
+    archiveRecords['manifest.json'] = JSON.stringify(manifest);
 
     const archiveOptions = compress ? { compress: 'gzip' as const } : undefined;
     const archive = new Bun.Archive(archiveRecords, archiveOptions);
+    let outputBytes: Uint8Array = await archive.bytes();
 
-    await Bun.write(chunkOutputPath, archive);
+    if (password) {
+      outputBytes = await encryptBuffer(outputBytes, password);
+    }
+
+    await Bun.write(chunkOutputPath, outputBytes);
 
     const writtenChunkFile = Bun.file(chunkOutputPath);
     const chunkSizeBytes = writtenChunkFile.size;
@@ -277,16 +357,22 @@ export async function encodeBackup(options: EncodeOptions): Promise<Manifest> {
     if (chunkMeta) {
       chunkMeta.sizeBytes = chunkSizeBytes;
     }
+
+    progressBar.update(i + 1);
   }
 
-  const manifestPath = join(outputDir, 'manifest.json');
-  await Bun.write(manifestPath, JSON.stringify(manifest, null, 2));
+  progressBar.finish();
+
+  const manifestPathGz = join(outputDir, 'manifest.json.gz');
+  const manifestJsonBytes = new TextEncoder().encode(JSON.stringify(manifest));
+  await Bun.write(manifestPathGz, Bun.gzipSync(manifestJsonBytes));
 
   console.log(`[SUCCESS] Backup completed!`);
   console.log(`  - Total Chunks: ${manifest.chunkCount}`);
   console.log(`  - Total Files: ${manifest.totalFiles}`);
   console.log(`  - Total Original Size: ${formatBytes(manifest.totalSizeBytes)}`);
-  console.log(`  - Manifest saved to: ${manifestPath}`);
+  console.log(`  - Encryption: ${password ? 'AES-256-GCM' : 'None'}`);
+  console.log(`  - Manifest saved to: ${manifestPathGz}`);
 
   return manifest;
 }
