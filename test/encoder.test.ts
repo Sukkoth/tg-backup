@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { rm, mkdir, unlink } from 'node:fs/promises';
+import { rm, mkdir, readdir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parseSizeString, formatBytes } from '../src/utils/size-utils.ts';
 import { parseIgnoreDirs, parseIgnoreExts, shouldIgnoreItem } from '../src/utils/ignore-utils.ts';
@@ -117,6 +117,32 @@ describe('Path Utils', () => {
 
     expect(res2.hadCollision).toBe(true);
     expect(res2.finalPath).toContain('Photo__case');
+  });
+});
+
+describe('Telegram Utils', () => {
+  test('throws descriptive error if upload file does not exist', async () => {
+    const { sendTelegramDocument } = await import('../src/utils/telegram-utils.ts');
+    expect(sendTelegramDocument('token', 'chatid', '/non/existent/file.bin')).rejects.toThrow();
+  });
+});
+
+describe('MTProto Utils', () => {
+  test('throws error if apiId or apiHash is missing', async () => {
+    const { createMTProtoClient } = await import('../src/utils/mtproto-utils.ts');
+    expect(createMTProtoClient(0, '')).rejects.toThrow();
+  });
+});
+
+describe('Cloud Provider Architecture', () => {
+  test('uploadBackup throws error for unsupported provider', async () => {
+    const { uploadBackup } = await import('../src/uploader.ts');
+    expect(uploadBackup({ chunkDir: './', provider: 'invalid_provider' })).rejects.toThrow();
+  });
+
+  test('downloadBackup throws error for unsupported provider', async () => {
+    const { downloadBackup } = await import('../src/downloader.ts');
+    expect(downloadBackup({ targetDir: './', provider: 'invalid_provider' })).rejects.toThrow();
   });
 });
 
@@ -242,6 +268,34 @@ describe('Encoder & Decoder Round-Trip Test (Synthetic Data)', () => {
     await rm(decOutputDir, { recursive: true, force: true });
   });
 
+  test('encodes and decodes with custom prefix (e.g. wedding_)', async () => {
+    const customPrefixOutputDir = join(import.meta.dir, 'fixtures/custom-prefix-output');
+    const customPrefixRestoredDir = join(import.meta.dir, 'fixtures/custom-prefix-restored');
+
+    await encodeBackup({
+      inputDir: testInputDir,
+      outputDir: customPrefixOutputDir,
+      minSizeBytes: 2 * 1024 * 1024,
+      maxSizeBytes: 4 * 1024 * 1024,
+      prefix: 'wedding_',
+      compress: true,
+      progress: false,
+    });
+
+    const manifestFile = Bun.file(join(customPrefixOutputDir, 'wedding_manifest.json.gz'));
+    expect(await manifestFile.exists()).toBe(true);
+
+    await decodeBackup({
+      inputDir: customPrefixOutputDir,
+      outputDir: customPrefixRestoredDir,
+      verify: true,
+      progress: false,
+    });
+
+    const restoredFiles = await readdir(customPrefixRestoredDir);
+    expect(restoredFiles.length).toBe(5);
+  });
+
   test('generates minified compact gzipped manifest without redundant part fields', async () => {
     const compactOutputDir = join(import.meta.dir, 'fixtures/compact-manifest-out');
 
@@ -255,7 +309,7 @@ describe('Encoder & Decoder Round-Trip Test (Synthetic Data)', () => {
       progress: false,
     });
 
-    const manifestGzFile = Bun.file(join(compactOutputDir, 'manifest.json.gz'));
+    const manifestGzFile = Bun.file(join(compactOutputDir, 'compact_chunk_manifest.json.gz'));
     expect(await manifestGzFile.exists()).toBe(true);
 
     const compressedBytes = await manifestGzFile.bytes();
@@ -278,7 +332,9 @@ describe('Encoder & Decoder Round-Trip Test (Synthetic Data)', () => {
   });
 
   test('decodes when standalone manifest.json.gz is removed (using embedded manifest)', async () => {
-    const standaloneManifestPath = join(testOutputDir, 'manifest.json.gz');
+    const dirFiles = await readdir(testOutputDir);
+    const standaloneManifestName = dirFiles.find((f) => f.endsWith('manifest.json.gz'))!;
+    const standaloneManifestPath = join(testOutputDir, standaloneManifestName);
     const embeddedRestoredDir = join(import.meta.dir, 'fixtures/embedded-manifest-restored');
 
     await unlink(standaloneManifestPath);
