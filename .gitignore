@@ -1,0 +1,9 @@
+node_modules/
+.env
+*.env
+output/
+my-backup/
+my-backup-output/
+my-backup-restored/
+*.tar.gz
+*.tar
