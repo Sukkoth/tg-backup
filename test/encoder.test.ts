@@ -114,6 +114,30 @@ describe('Encoder & Decoder Round-Trip Test (Synthetic Data)', () => {
     expect(restoredHash).toBe(originalHash);
   });
 
+  test('overwrites existing files on re-extraction without creating duplicate files', async () => {
+    const overwriteRestoredDir = join(import.meta.dir, 'fixtures/overwrite-test');
+
+    // Run 1
+    await decodeBackup({
+      inputDir: testOutputDir,
+      outputDir: overwriteRestoredDir,
+      verify: true,
+    });
+
+    // Run 2 (re-extracting into same output folder)
+    await decodeBackup({
+      inputDir: testOutputDir,
+      outputDir: overwriteRestoredDir,
+      verify: true,
+    });
+
+    const file1Path = join(overwriteRestoredDir, 'file1.txt');
+    expect(await Bun.file(file1Path).exists()).toBe(true);
+    expect(await Bun.file(join(overwriteRestoredDir, 'file1 (2).txt')).exists()).toBe(false);
+
+    await rm(overwriteRestoredDir, { recursive: true, force: true });
+  });
+
   test('decodes when standalone manifest.json is removed (using embedded manifest)', async () => {
     const standaloneManifestPath = join(testOutputDir, 'manifest.json');
     const embeddedRestoredDir = join(import.meta.dir, 'fixtures/embedded-manifest-restored');
